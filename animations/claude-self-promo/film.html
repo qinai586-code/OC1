@@ -1,0 +1,777 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Claude, untangled (unofficial experiment)</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0910; overflow: hidden; }
+  canvas { display: block; width: 1920px; height: 1080px; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script src="cues.js"></script>
+<script>
+// Self-promo film for Claude, drawn entirely on one canvas.
+// renderAt(t) is a pure function of t (seconds), so every frame is reproducible.
+// Scenes: tangle -> untangle into a plan -> write + run checks -> chart pops -> lockup.
+(() => {
+  'use strict';
+
+  const CUE = window.CUE;
+  const T = CUE.T;
+  const W = 1920, H = 1080;
+  const ctx = document.getElementById('c').getContext('2d');
+
+  // ---- palette and type ----------------------------------------------------
+  const COL = {
+    ink: '#1B1722', cream: '#F6EEDB', orange: '#FF8A4C', orangeHi: '#FFC08A',
+    lilac: '#B9A7FF', mint: '#7EE2B8', coral: '#FF6B6B', muted: '#8D86A3',
+    code: '#E9E2F4', panel: '#221E2D', panelTop: '#2A2536', edge: '#363148',
+    butter: '#F6E7A8', peach: '#FFC9B0', mintNote: '#BDEBD6', lilacNote: '#D7CCFF', sky: '#BCE0FF',
+  };
+  const SANS = 'Inter, "Liberation Sans", Arial, sans-serif';
+  const DISPLAY = '"Inter Display", Inter, "Liberation Sans", sans-serif';
+  const MONO = '"DejaVu Sans Mono", "Liberation Mono", monospace';
+
+  // ---- layout ----------------------------------------------------------------
+  const R = 62;                                   // spark body radius
+  const NOTE_W = 330, NOTE_H = 140;               // sticky notes in the tangle
+  const LIST_X = 100, LIST_W = 600, ROW_H = 100, ROW_GAP = 118, ROW_Y0 = 360;
+  const PANEL = { x: 780, y: 150, w: 1020, h: 750 };
+  const SPARK_HOME = { x: 330, y: 205 };
+  const SPARK_CENTER = { x: 960, y: 430 };
+  const SPARK_LOCK = { x: 700, y: 470 };
+  const ROW0 = { x: LIST_X + LIST_W / 2, y: ROW_Y0 + ROW_H / 2 };
+  const CHECK_LABELS = ['three bars', 'Tue is the tallest', 'last bar stays inside the chart'];
+
+  // ---- helpers ----------------------------------------------------------------
+  const clamp01 = x => (x < 0 ? 0 : x > 1 ? 1 : x);
+  const prog = (t, a, b) => clamp01((t - a) / (b - a));
+  const lerp = (a, b, k) => a + (b - a) * k;
+  const eio3 = x => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+  const eo3 = x => 1 - Math.pow(1 - x, 3);
+  const eBack = x => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); };
+  // fade in over fi seconds after a, fade out over fo seconds before b
+  const win = (t, a, b, fi = 0.3, fo = 0.3) => eo3(prog(t, a, a + fi)) * (1 - eo3(prog(t, b - fo, b)));
+  const pad2 = n => (n < 10 ? '0' : '') + n;
+  function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+  function rng(seed) {                             // mulberry32: deterministic particles
+    let s = seed >>> 0;
+    return () => {
+      s = (s + 0x6D2B79F5) >>> 0;
+      let x = s;
+      x = Math.imul(x ^ (x >>> 15), x | 1);
+      x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
+      return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---- the code on screen is the code that runs ---------------------------------
+  const BEFORE_LINES = CUE.CODE_BEFORE.split('\n');
+  const AFTER_LINES = CUE.CODE_AFTER.split('\n');
+  const EDIT_LINE = BEFORE_LINES.findIndex((l, i) => l !== AFTER_LINES[i]);
+  const PREFIX = (() => {
+    const a = BEFORE_LINES[EDIT_LINE], b = AFTER_LINES[EDIT_LINE];
+    let k = 0;
+    while (k < a.length && a[k] === b[k]) k++;
+    return a.slice(0, k);
+  })();
+  const DEL_TAIL = BEFORE_LINES[EDIT_LINE].slice(PREFIX.length);
+  const TYPE_TAIL = AFTER_LINES[EDIT_LINE].slice(PREFIX.length);
+
+  function evaluateChart(code) {
+    return new Function(code + '\nreturn { bars, layout };')();
+  }
+  function runChecks(code) {
+    const { bars, layout } = evaluateChart(code);
+    const L = layout(bars, 600);
+    const tallest = bars.reduce((a, b) => (b.value > a.value ? b : a)).day;
+    const last = L[L.length - 1];
+    const right = last.x + last.w;
+    return [
+      { ok: L.length === 3, detail: `${L.length} bars` },
+      { ok: tallest === 'Tue', detail: `tallest: ${tallest}` },
+      { ok: right <= 600 + 1e-6, detail: `right edge ${Math.round(right)} px, chart is 600 px` },
+    ];
+  }
+  const RUN1 = runChecks(CUE.CODE_BEFORE);
+  const RUN2 = runChecks(CUE.CODE_AFTER);
+  const CHART = evaluateChart(CUE.CODE_AFTER);
+  const CHART_BARS = CHART.layout(CHART.bars, 600);
+
+  // ---- sticky notes ----------------------------------------------------------------
+  const NOTES = [
+    { text: 'make it pop',       color: COL.butter,    x: 860,  y: 440, r: -0.10, row: 0, rowText: 'Make it pop: bold, clear bars' },
+    { text: 'the Tuesday thing', color: COL.peach,     x: 1240, y: 390, r: 0.09,  row: 1, rowText: "Tuesday's numbers (assumed)" },
+    { text: 'no, the other one', color: COL.mintNote, x: 1180, y: 660, r: -0.05, row: 1, merge: true },
+    { text: 'maybe a chart??',   color: COL.lilacNote, x: 760,  y: 700, r: 0.07,  row: 2, rowText: 'One chart, three bars' },
+    { text: 'also fix the bug',  color: COL.sky,       x: 1380, y: 640, r: -0.09, row: 3, rowText: 'Check the work, fix the bug' },
+  ];
+  const rowCenter = row => ({ x: LIST_X + LIST_W / 2, y: ROW_Y0 + row * ROW_GAP + ROW_H / 2 });
+
+  function noteState(i, t) {
+    const n = NOTES[i];
+    const drop = T.notesIn + i * T.noteStep;
+    const fall = eBack(prog(t, drop, drop + 0.55));
+    const spin = (1 - prog(t, drop, drop + 0.55)) * -0.35;
+    let x = n.x + 5 * Math.sin(t * 0.8 + i * 1.3);
+    let y = n.y + 4 * Math.cos(t * 0.7 + i * 0.9) + (1 - fall) * -760;
+    let r = n.r + 0.05 * Math.sin(t * 0.6 + i) + spin;
+    const target = rowCenter(n.row);
+    const ms = T.move + T.moveOffs[i];
+    const k = eio3(prog(t, ms, ms + T.moveDur));
+    x = lerp(x, target.x, k);
+    y = lerp(y, target.y, k);
+    r = lerp(r, 0, k);
+    return {
+      x, y, r, k, ms,
+      w: lerp(NOTE_W, LIST_W, k),
+      h: lerp(NOTE_H, ROW_H, k),
+      alpha: prog(t, drop, drop + 0.12),
+    };
+  }
+
+  function sticky(x, y, w, h, rot, scale, color, alpha, tape, draw) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.scale(scale, scale);
+    ctx.shadowColor = 'rgba(0,0,0,0.38)';
+    ctx.shadowBlur = 30;
+    ctx.shadowOffsetY = 14;
+    ctx.fillStyle = color;
+    rr(-w / 2, -h / 2, w, h, 14);
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetY = 0;
+    if (tape > 0) {
+      ctx.globalAlpha = alpha * tape;
+      ctx.fillStyle = 'rgba(255,255,255,0.4)';
+      ctx.fillRect(-46, -h / 2 - 12, 92, 26);
+      ctx.globalAlpha = alpha;
+    }
+    draw(w, h);
+    ctx.restore();
+  }
+
+  function drawNote(i, t, listA) {
+    const n = NOTES[i];
+    const s = noteState(i, t);
+    let a = s.alpha * listA;
+    if (n.merge) a *= 1 - prog(t, T.merge, T.merge + 0.3);
+    if (a <= 0.002) return;
+    const toRow = prog(t, T.rewrite, T.rewrite + 0.4);
+    const bump = n.row === 0 && t > T.pop ? 1 + 0.07 * Math.sin(Math.PI * prog(t, T.pop, T.pop + 0.45)) : 1;
+    const done = n.row === 0 && t >= T.pop + 0.05;
+    sticky(s.x, s.y, s.w, s.h, s.r, bump, n.color, a, 1 - s.k, (w, h) => {
+      ctx.textBaseline = 'middle';
+      if (!n.merge) {
+        ctx.globalAlpha = a * (1 - toRow);
+        ctx.textAlign = 'center';
+        ctx.fillStyle = COL.ink;
+        ctx.font = `600 32px ${SANS}`;
+        ctx.fillText(n.text, 0, 0);
+      }
+      if (n.rowText) {
+        ctx.globalAlpha = a * toRow;
+        ctx.textAlign = 'left';
+        ctx.fillStyle = COL.ink;
+        ctx.font = `600 28px ${SANS}`;
+        ctx.fillText(n.rowText, -w / 2 + 104, 0);
+        // number chip; becomes a check once the task is done
+        const ca = a * eo3(prog(t, s.ms + 0.3, s.ms + 0.7));
+        const cx = -w / 2 + 54;
+        ctx.globalAlpha = ca;
+        ctx.fillStyle = done ? COL.mint : COL.ink;
+        rr(cx - 30, -20, 60, 40, 10);
+        ctx.fill();
+        if (done) {
+          ctx.strokeStyle = COL.ink;
+          ctx.lineWidth = 4.5;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.beginPath();
+          ctx.moveTo(cx - 9, 1); ctx.lineTo(cx - 2, 8); ctx.lineTo(cx + 10, -7);
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = COL.cream;
+          ctx.font = `800 24px ${DISPLAY}`;
+          ctx.textAlign = 'center';
+          ctx.fillText(pad2(n.row + 1), cx, 1);
+        }
+      }
+    });
+  }
+
+  // yarn that tangles the notes together at the start
+  const STRINGS = [[0, 2], [1, 3], [2, 4], [0, 3], [1, 2], [3, 4], [4, 0]];
+  function drawStrings(t) {
+    const a = eo3(prog(t, T.tangle, T.tangle + 0.5)) * (1 - eo3(prog(t, T.tangleOut, T.tangleOut + 0.6)));
+    if (a <= 0.002) return;
+    ctx.save();
+    ctx.strokeStyle = COL.cream;
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 5;
+    STRINGS.forEach(([p, q], idx) => {
+      const A = noteState(p, t), B = noteState(q, t);
+      const mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2;
+      const dx = B.x - A.x, dy = B.y - A.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const bulge = 90 * Math.sin(t * 1.3 + idx * 2.1) + 40;
+      ctx.globalAlpha = a * 0.55;
+      ctx.beginPath();
+      ctx.moveTo(A.x, A.y);
+      ctx.quadraticCurveTo(mx - dy / len * bulge, my + dx / len * bulge, B.x, B.y);
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+
+  // ---- the spark: a small original character -------------------------------------
+  function sparkPos(t) {
+    let x, y;
+    if (t < T.drop) { x = SPARK_CENTER.x; y = -300; }
+    else if (t < T.land) { const k = prog(t, T.drop, T.land); x = SPARK_CENTER.x; y = lerp(-300, SPARK_CENTER.y, k * k); }
+    else if (t < T.moveLeft) { x = SPARK_CENTER.x; y = SPARK_CENTER.y; }
+    else if (t < T.moveLeft + 0.9) {
+      const k = eio3(prog(t, T.moveLeft, T.moveLeft + 0.9));
+      x = lerp(SPARK_CENTER.x, SPARK_HOME.x, k); y = lerp(SPARK_CENTER.y, SPARK_HOME.y, k);
+    }
+    else if (t < T.lockStart) { x = SPARK_HOME.x; y = SPARK_HOME.y; }
+    else {
+      const k = eio3(prog(t, T.lockStart, T.lockEnd));
+      x = lerp(SPARK_HOME.x, SPARK_LOCK.x, k); y = lerp(SPARK_HOME.y, SPARK_LOCK.y, k);
+    }
+    if (t > T.land) y += 5 * Math.sin(t * 2.3);
+    return { x, y };
+  }
+  function sparkSquash(t) {
+    let sq = 0;
+    const d = t - T.land;
+    if (d > 0) sq += 0.28 * Math.exp(-6 * d) * Math.cos(15 * d);          // landing
+    const h = t - T.happy;
+    if (h > 0 && h < 1.5) sq += 0.08 * Math.exp(-5 * h) * Math.cos(12 * h); // happy bounce
+    const z = t - T.zap;
+    if (z > 0 && z < 0.6) sq += 0.1 * Math.exp(-9 * z) * Math.cos(20 * z);  // zap recoil
+    const l = t - T.lockEnd;
+    if (l > 0 && l < 1) sq += 0.22 * Math.exp(-7 * l) * Math.cos(16 * l);   // lockup landing
+    if (t > T.lockStart - 0.25 && t < T.lockStart) {                          // anticipation
+      sq -= 0.12 * Math.sin(Math.PI * prog(t, T.lockStart - 0.25, T.lockStart));
+    }
+    return sq;
+  }
+  function sparkMood(t) {
+    if (t >= T.wink && t < T.wink + 0.25) return 'wink';
+    if (t >= T.happy) return 'happy';
+    if (t >= T.oops && t < T.editStart) return 'oops';
+    if (t >= T.editStart && t < T.happy) return 'focus';
+    return 'neutral';
+  }
+  function drawSpark(t) {
+    const p = sparkPos(t);
+    const sq = sparkSquash(t);
+    const mood = sparkMood(t);
+    const bp = t % 2.7;
+    const blink = bp > 2.52 && bp < 2.62 && (mood === 'neutral');
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.scale(1 + sq, 1 - sq);
+    // flickering rays
+    ctx.strokeStyle = COL.orange;
+    ctx.lineWidth = 11;
+    ctx.lineCap = 'round';
+    for (let k = 0; k < 4; k++) {
+      const a = Math.PI / 4 + k * Math.PI / 2 + 0.1 * Math.sin(t * 1.1);
+      const r0 = R + 14, r1 = r0 + 14 + 8 * Math.sin(t * 6.5 + k * 1.9);
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * r0, Math.sin(a) * r0);
+      ctx.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
+      ctx.stroke();
+    }
+    // body
+    const g = ctx.createRadialGradient(-20, -24, 6, 0, 0, R);
+    g.addColorStop(0, '#FFE6C7');
+    g.addColorStop(0.55, '#FFA06A');
+    g.addColorStop(1, '#F0683A');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(0, 0, R, 0, Math.PI * 2);
+    ctx.fill();
+    // cheeks
+    if (mood === 'happy' || mood === 'wink') {
+      ctx.fillStyle = 'rgba(255,110,120,0.35)';
+      ctx.beginPath();
+      ctx.arc(-34, 14, 8, 0, Math.PI * 2);
+      ctx.arc(34, 14, 8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // eyes
+    ctx.strokeStyle = COL.ink;
+    ctx.fillStyle = COL.ink;
+    ctx.lineWidth = 6;
+    for (const ex of [-20, 20]) {
+      if (mood === 'happy' || (mood === 'wink' && ex > 0)) {
+        ctx.beginPath(); ctx.arc(ex, -4, 9, Math.PI, Math.PI * 2); ctx.stroke();
+      } else if (mood === 'focus' || blink) {
+        ctx.beginPath(); ctx.moveTo(ex - 9, -7); ctx.lineTo(ex + 9, -7); ctx.stroke();
+      } else {
+        const ry = mood === 'oops' ? 8 : 11;
+        ctx.beginPath(); ctx.ellipse(ex, -8, 7, ry, 0, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    // mouth
+    if (mood === 'happy' || mood === 'wink') {
+      ctx.beginPath();
+      ctx.arc(0, 14, 17, 0.12 * Math.PI, 0.88 * Math.PI);
+      ctx.closePath();
+      ctx.fill();
+    } else if (mood === 'oops') {
+      ctx.beginPath();
+      ctx.arc(0, 36, 14, 1.2 * Math.PI, 1.8 * Math.PI);
+      ctx.stroke();
+      // sweat drop
+      ctx.fillStyle = '#9FD8FF';
+      ctx.beginPath();
+      ctx.arc(56, -24, 9, 0, Math.PI * 2);
+      ctx.moveTo(56, -40); ctx.lineTo(47, -24); ctx.lineTo(65, -24);
+      ctx.fill();
+    } else if (mood === 'focus') {
+      ctx.beginPath(); ctx.moveTo(-9, 24); ctx.lineTo(9, 24); ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.arc(0, 14, 13, 0.15 * Math.PI, 0.85 * Math.PI);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function drawThought(t) {
+    const a = win(t, T.think, T.moveLeft + 0.1, 0.3, 0.3);
+    if (a <= 0.002) return;
+    const p = sparkPos(t);
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.fillStyle = COL.cream;
+    ctx.beginPath(); ctx.arc(p.x + 52, p.y - 84, 8, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(p.x + 76, p.y - 110, 13, 0, Math.PI * 2); ctx.fill();
+    const bx = p.x + 120, by = p.y - 160;
+    ctx.beginPath(); ctx.ellipse(bx, by, 64, 44, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = COL.ink;
+    for (let k = 0; k < 3; k++) {
+      const ph = Math.sin(t * 6 - k * 0.9);
+      ctx.beginPath(); ctx.arc(bx - 28 + k * 28, by, 6 + 3 * Math.max(0, ph), 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ---- the code editor: typing, a failing check, the fix, a rerun ----------------------
+  function drawCodeLine(s, x, y) {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.font = `500 24px ${MONO}`;
+    let cx = x;
+    for (const tok of tokenize(s)) {
+      ctx.fillStyle = tok.c;
+      ctx.fillText(tok.s, cx, y);
+      cx += ctx.measureText(tok.s).width;
+    }
+  }
+  const KEYWORDS = new Set(['const', 'function', 'return']);
+  function tokenize(line) {
+    const out = [];
+    const re = /("[^"]*")|(\b\d+\b)|([A-Za-z_]\w*)|([\s\S])/g;
+    let m;
+    while ((m = re.exec(line))) {
+      let c = COL.code;
+      if (m[1]) c = COL.mint;
+      else if (m[2]) c = COL.lilac;
+      else if (m[3] && KEYWORDS.has(m[3])) c = COL.orange;
+      out.push({ s: m[0], c });
+    }
+    return out;
+  }
+  // which lines are on screen at time t, where the caret sits, and which line is highlighted
+  function codeAt(t) {
+    if (t < T.typeStart) return { lines: [], caret: -1, hl: -1 };
+    if (t < T.typeEnd) {
+      const n = Math.floor(prog(t, T.typeStart, T.typeEnd) * CUE.CODE_BEFORE.length);
+      const lines = CUE.CODE_BEFORE.slice(0, n).split('\n');
+      return { lines, caret: lines.length - 1, hl: -1 };
+    }
+    if (t < T.editStart) return { lines: BEFORE_LINES.slice(), caret: -1, hl: -1 };
+    if (t < T.editEnd) {
+      const lines = BEFORE_LINES.slice();
+      if (t < T.editDel) {
+        const keep = DEL_TAIL.length - Math.round(prog(t, T.editStart, T.editDel) * DEL_TAIL.length);
+        lines[EDIT_LINE] = PREFIX + DEL_TAIL.slice(0, keep);
+      } else {
+        const k = Math.round(prog(t, T.editDel, T.editEnd) * TYPE_TAIL.length);
+        lines[EDIT_LINE] = PREFIX + TYPE_TAIL.slice(0, k);
+      }
+      return { lines, caret: EDIT_LINE, hl: EDIT_LINE, flash: false };
+    }
+    return { lines: AFTER_LINES.slice(), caret: -1, hl: t < T.editEnd + 0.5 ? EDIT_LINE : -1, flash: t < T.editEnd + 0.5 };
+  }
+
+  function drawEditor(t, alpha, py) {
+    const px = PANEL.x;
+    const shake = t > T.resolve1[2] && t < T.resolve1[2] + 0.6
+      ? 7 * Math.sin((t - T.resolve1[2]) * 70) * Math.exp(-(t - T.resolve1[2]) * 9) : 0;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.shadowColor = 'rgba(0,0,0,0.42)';
+    ctx.shadowBlur = 44;
+    ctx.shadowOffsetY = 22;
+    ctx.fillStyle = COL.panel;
+    rr(px + shake, py, PANEL.w, PANEL.h, 22);
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetY = 0;
+    ctx.strokeStyle = COL.edge;
+    ctx.lineWidth = 2;
+    rr(px + shake, py, PANEL.w, PANEL.h, 22);
+    ctx.stroke();
+    // title bar
+    ctx.fillStyle = COL.panelTop;
+    ctx.beginPath();
+    ctx.roundRect(px + shake, py, PANEL.w, 56, [22, 22, 0, 0]);
+    ctx.fill();
+    ['#FF6B6B', '#FFD166', '#7EE2B8'].forEach((c, k) => {
+      ctx.fillStyle = c;
+      ctx.beginPath(); ctx.arc(px + shake + 30 + k * 22, py + 28, 7, 0, Math.PI * 2); ctx.fill();
+    });
+    ctx.fillStyle = COL.muted;
+    ctx.font = `500 20px ${MONO}`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('chart.js', px + shake + 120, py + 28);
+
+    // code
+    const { lines, caret, hl, flash } = codeAt(t);
+    const x0 = px + shake + 44, y0 = py + 110, LH = 36;
+    if (hl >= 0) {
+      const hy = y0 + hl * LH;
+      ctx.fillStyle = flash ? 'rgba(126,226,184,0.16)' : 'rgba(255,138,76,0.14)';
+      rr(px + shake + 26, hy - LH / 2, PANEL.w - 52, LH, 8);
+      ctx.fill();
+    }
+    lines.forEach((ln, i) => drawCodeLine(ln, x0, y0 + i * LH));
+    if (caret >= 0 && Math.floor(t * 2.5) % 2 === 0) {
+      const ln = lines[caret] || '';
+      ctx.font = `500 24px ${MONO}`;
+      const cw = ctx.measureText(ln).width;
+      ctx.fillStyle = COL.orangeHi;
+      ctx.fillRect(x0 + cw + 2, y0 + caret * LH - 13, 13, 26);
+    }
+
+    // checks
+    ctx.fillStyle = COL.edge;
+    ctx.fillRect(px + shake + 44, py + 440, PANEL.w - 88, 2);
+    if (t >= T.checksRun) {
+      const run = t < T.rerun ? 1 : 2;
+      ctx.fillStyle = COL.muted;
+      ctx.font = `600 20px ${MONO}`;
+      ctx.textAlign = 'right';
+      ctx.fillText(`run ${run}`, px + shake + PANEL.w - 44, py + 478);
+    }
+    ctx.fillStyle = COL.muted;
+    ctx.font = `600 20px ${MONO}`;
+    ctx.textAlign = 'left';
+    ctx.fillText('CHECKS', px + shake + 44, py + 478);
+    if (t >= T.checksRun) drawChecks(t, px + shake, py);
+    ctx.restore();
+  }
+
+  function drawChecks(t, px, py) {
+    const run = t < T.rerun ? 1 : 2;
+    const res = run === 1 ? RUN1 : RUN2;
+    const times = run === 1 ? T.resolve1 : T.resolve2;
+    const start = run === 1 ? T.checksRun : T.rerun;
+    CHECK_LABELS.forEach((label, i) => {
+      const cy = py + 530 + i * 80;
+      const cx = px + 66;
+      const appear = eo3(prog(t, start + i * 0.08, start + i * 0.08 + 0.25));
+      const done = t >= times[i];
+      ctx.save();
+      ctx.globalAlpha = appear;
+      if (!done) {
+        const a0 = t * 9 + i * 2;
+        ctx.strokeStyle = COL.muted;
+        ctx.lineWidth = 4;
+        ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.arc(cx, cy, 15, a0, a0 + 1.6 * Math.PI); ctx.stroke();
+      } else if (res[i].ok) {
+        ctx.fillStyle = COL.mint;
+        ctx.beginPath(); ctx.arc(cx, cy, 19, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = COL.ink;
+        ctx.lineWidth = 4.5;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath(); ctx.moveTo(cx - 8, cy); ctx.lineTo(cx - 2, cy + 6); ctx.lineTo(cx + 9, cy - 7); ctx.stroke();
+      } else {
+        ctx.fillStyle = COL.coral;
+        ctx.beginPath(); ctx.arc(cx, cy, 19, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = COL.ink;
+        ctx.lineWidth = 4.5;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(cx - 7, cy - 7); ctx.lineTo(cx + 7, cy + 7);
+        ctx.moveTo(cx + 7, cy - 7); ctx.lineTo(cx - 7, cy + 7);
+        ctx.stroke();
+      }
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = COL.cream;
+      ctx.font = `600 30px ${SANS}`;
+      ctx.fillText(label, px + 104, cy - 13);
+      ctx.font = `500 21px ${MONO}`;
+      ctx.fillStyle = done ? (res[i].ok ? COL.mint : COL.coral) : COL.muted;
+      ctx.fillText(done ? res[i].detail : 'running...', px + 104, cy + 19);
+      ctx.restore();
+    });
+  }
+
+  // ---- the chart: the fixed layout, drawn from the same numbers --------------------
+  function drawChart(t, alpha, py) {
+    const px = PANEL.x;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.shadowColor = 'rgba(0,0,0,0.42)';
+    ctx.shadowBlur = 44;
+    ctx.shadowOffsetY = 22;
+    ctx.fillStyle = COL.panel;
+    rr(px, py, PANEL.w, PANEL.h, 22);
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetY = 0;
+    ctx.strokeStyle = COL.edge;
+    ctx.lineWidth = 2;
+    rr(px, py, PANEL.w, PANEL.h, 22);
+    ctx.stroke();
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COL.cream;
+    ctx.font = `600 40px ${SANS}`;
+    ctx.fillText('This week', px + 60, py + 70);
+    ctx.fillStyle = COL.muted;
+    ctx.font = `500 22px ${SANS}`;
+    ctx.fillText('Numbers are assumed (see row 02).', px + 60, py + 110);
+
+    const sc = 1.5, bx0 = 840, base = 800, maxH = 400;
+    ctx.strokeStyle = 'rgba(246,238,219,0.16)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(bx0, base + 1); ctx.lineTo(bx0 + 600 * sc, base + 1); ctx.stroke();
+    CHART_BARS.forEach((b, i) => {
+      const t0 = T.bars + i * T.barStep;
+      const k = eBack(prog(t, t0, t0 + 0.55));
+      const hgt = Math.max(0, (b.value / 31) * maxH * k);
+      const x = bx0 + b.x * sc, w = b.w * sc;
+      const isTue = b.day === 'Tue';
+      const g = ctx.createLinearGradient(0, base - hgt, 0, base);
+      if (isTue) { g.addColorStop(0, COL.orangeHi); g.addColorStop(1, COL.orange); }
+      else { g.addColorStop(0, '#A697F0'); g.addColorStop(1, '#6F5FCB'); }
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.roundRect(x, base - hgt, w, hgt, [14, 14, 0, 0]);
+      ctx.fill();
+      const la = prog(t, t0 + 0.35, t0 + 0.7);
+      ctx.globalAlpha = alpha * la;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = COL.cream;
+      ctx.font = `700 34px ${SANS}`;
+      ctx.fillText(String(b.value), x + w / 2, base - hgt - 28);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = COL.muted;
+      ctx.font = `600 26px ${SANS}`;
+      ctx.fillText(b.day, x + w / 2, base + 44);
+    });
+    ctx.restore();
+  }
+
+  // ---- captions, lockup, particles, and the zap ------------------------------------
+  function drawCaptions(t) {
+    const caps = [
+      [T.cap1, 3.75, 'One request. Five opinions.'],
+      [6.9, 7.9, 'Untangle it into a list.'],
+      [12.3, 13.6, 'Forgot the gaps. It happens.'],
+      [15.3, 16.2, 'Ran it again. All three pass.'],
+      [18.2, 19.3, 'Make it pop. Done.'],
+    ];
+    for (const [a, b, text] of caps) {
+      const al = win(t, a, b, 0.3, 0.3);
+      if (al <= 0.002) continue;
+      ctx.save();
+      ctx.globalAlpha = al;
+      ctx.font = `600 54px ${SANS}`;
+      ctx.fillStyle = COL.cream;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, W / 2, 968 + (1 - al) * 14);
+      ctx.restore();
+    }
+  }
+
+  function drawLockup(t) {
+    const a = prog(t, T.wordIn, T.wordIn + 0.7);
+    if (a > 0) {
+      ctx.save();
+      ctx.globalAlpha = eo3(a);
+      ctx.fillStyle = COL.cream;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = `800 150px ${DISPLAY}`;
+      ctx.letterSpacing = '-4px';
+      ctx.fillText('Claude', 800, SPARK_LOCK.y + (1 - eo3(a)) * 24);
+      ctx.restore();
+    }
+    const tg = prog(t, T.tagIn, T.tagIn + 0.6);
+    if (tg > 0) {
+      ctx.save();
+      ctx.globalAlpha = eo3(tg);
+      ctx.fillStyle = '#E9E1F5';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = `500 50px ${SANS}`;
+      ctx.fillText("Bring the mess. I'll check the work.", 804, 606);
+      ctx.restore();
+    }
+    const dc = prog(t, T.discIn, T.discIn + 0.6);
+    if (dc > 0) {
+      ctx.save();
+      ctx.globalAlpha = eo3(dc) * 0.8;
+      ctx.fillStyle = COL.muted;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = `400 24px ${SANS}`;
+      ctx.fillText('An unofficial creative experiment. Drawn and scored in code. No stock footage or audio.', W / 2, 992);
+      ctx.restore();
+    }
+  }
+
+  function burst(ox, oy, t0, t, seed, n, speed, colors, life) {
+    const d = t - t0;
+    if (d < 0 || d > life) return;
+    const r = rng(seed);
+    for (let k = 0; k < n; k++) {
+      const a = r() * Math.PI * 2;
+      const sp = speed * (0.5 + r());
+      const x = ox + Math.cos(a) * sp * d;
+      const y = oy + Math.sin(a) * sp * d - 120 * d + 450 * d * d;
+      const size = (4 + r() * 6) * (1 - 0.5 * d / life);
+      ctx.globalAlpha = 1 - d / life;
+      ctx.fillStyle = colors[k % colors.length];
+      ctx.beginPath(); ctx.arc(x, y, size, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawZap(t) {
+    const d = prog(t, T.zap, T.zap + 0.25);
+    if (d <= 0 || d >= 1) return;
+    const p = sparkPos(t);
+    const x0 = p.x + 40, y0 = p.y + 22, x1 = ROW0.x, y1 = ROW0.y;
+    const r = rng(Math.floor(t * 60));
+    ctx.save();
+    ctx.globalAlpha = Math.sin(Math.PI * d);
+    ctx.strokeStyle = COL.orangeHi;
+    ctx.lineWidth = 5;
+    ctx.lineJoin = 'round';
+    ctx.shadowColor = COL.orange;
+    ctx.shadowBlur = 18;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    for (let k = 1; k <= 6; k++) {
+      const u = k / 6, j = k < 6 ? 36 : 0;
+      ctx.lineTo(lerp(x0, x1, u) + (r() - 0.5) * j, lerp(y0, y1, u) + (r() - 0.5) * j);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // ---- background ---------------------------------------------------------------------
+  function drawBG(t) {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#1A1625');
+    g.addColorStop(1, '#0B0910');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    const p = sparkPos(t);
+    const rg = ctx.createRadialGradient(p.x, p.y, 20, p.x, p.y, 760);
+    rg.addColorStop(0, 'rgba(255,138,76,0.16)');
+    rg.addColorStop(1, 'rgba(255,138,76,0)');
+    ctx.fillStyle = rg;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(246,238,219,0.05)';
+    for (let x = 60; x < W; x += 60) {
+      for (let y = 60; y < H; y += 60) {
+        ctx.beginPath(); ctx.arc(x, y, 2, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+  }
+
+  // ---- frame ------------------------------------------------------------------------------
+  function renderAt(t) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.letterSpacing = '0px';
+    drawBG(t);
+
+    const listA = 1 - eo3(prog(t, T.outro, T.outro + 0.5));
+    drawStrings(t);
+
+    const planA = prog(t, T.planIn, T.planIn + 0.5) * listA;
+    if (planA > 0) {
+      ctx.save();
+      ctx.globalAlpha = planA;
+      ctx.fillStyle = COL.lilac;
+      ctx.font = `700 22px ${SANS}`;
+      ctx.letterSpacing = '4px';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('PLAN', LIST_X, 300);
+      ctx.restore();
+    }
+    for (let i = 0; i < NOTES.length; i++) drawNote(i, t, listA);
+
+    const edA = win(t, T.edIn, T.edOut, 0.45, 0.5);
+    if (edA > 0.002) {
+      const slide = (1 - eBack(prog(t, T.edIn, T.edIn + 0.5))) * 70;
+      drawEditor(t, edA, PANEL.y + slide);
+    }
+
+    const chA = eo3(prog(t, T.chartIn, T.chartIn + 0.5)) * (1 - eo3(prog(t, T.outro, T.outro + 0.5)));
+    if (chA > 0.002) {
+      const slide = (1 - eBack(prog(t, T.chartIn, T.chartIn + 0.5))) * 70;
+      drawChart(t, chA, PANEL.y + slide);
+    }
+
+    drawThought(t);
+    drawZap(t);
+    burst(ROW0.x, ROW0.y, T.pop, t, 11, 26, 380, [COL.orange, COL.orangeHi, COL.cream, COL.mint], 0.8);
+    burst(SPARK_LOCK.x, SPARK_LOCK.y, T.lockEnd, t, 5, 18, 300, [COL.orange, COL.cream, COL.lilac], 0.9);
+    burst(1290, 520, T.resolve2[2], t, 21, 22, 420, [COL.mint, COL.orangeHi, COL.lilac, COL.cream], 0.8);
+    ctx.globalAlpha = 1;
+
+    drawSpark(t);
+    drawCaptions(t);
+    drawLockup(t);
+
+    const fade = prog(t, T.fadeOut, 25);
+    if (fade > 0) {
+      ctx.globalAlpha = fade;
+      ctx.fillStyle = '#0B0910';
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  window.renderAt = renderAt;
+  renderAt(0);
+})();
+</script>
+</body>
+</html>
